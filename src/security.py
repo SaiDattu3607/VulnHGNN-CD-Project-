@@ -21,6 +21,9 @@ logger = logging.getLogger("security")
 # Maximum IR file size (10 MB) — prevents memory exhaustion
 MAX_IR_SIZE_BYTES = 10 * 1024 * 1024
 
+# Source code is compiled and analyzed locally; keep request work bounded.
+MAX_SOURCE_SIZE_BYTES = 1 * 1024 * 1024
+
 # Maximum number of functions in a single IR file
 MAX_FUNCTIONS = 500
 
@@ -37,6 +40,20 @@ _SUSPICIOUS_PATTERNS = [
     re.compile(r'__asm__', re.IGNORECASE),                 # GCC-style asm
     re.compile(r'module\s+asm', re.IGNORECASE),            # module-level asm
 ]
+
+
+def validate_source_input(source: str) -> tuple:
+    """Validate source text before it is written to disk or compiled."""
+    if not isinstance(source, str) or not source.strip():
+        return False, "Source code is empty or not a string."
+    if "\x00" in source:
+        return False, "Source code contains a null byte."
+
+    size = len(source.encode("utf-8", errors="replace"))
+    if size > MAX_SOURCE_SIZE_BYTES:
+        return False, f"Source code exceeds the {MAX_SOURCE_SIZE_BYTES}-byte limit."
+
+    return True, "Source code is valid."
 
 
 def validate_ir_input(ll_content: str) -> tuple:
@@ -124,6 +141,51 @@ def validate_ir_json(ir_data: dict) -> tuple:
 # ════════════════════════════════════════════════════════════════════════
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
+
+_SEVERITY_RISK_WEIGHTS = {
+    "CRITICAL": 80,
+    "HIGH": 60,
+    "MEDIUM": 35,
+    "LOW": 20,
+}
+
+
+def calculate_security_estimate(predictions: list) -> dict:
+    """Estimate risk from detected, supported CWE predictions."""
+    findings = [
+        prediction for prediction in predictions
+        if prediction.get("detected")
+        and prediction.get("class") != "non-vulnerable"
+    ]
+
+    risk_points = 0.0
+    for finding in findings:
+        try:
+            probability = float(finding.get("probability", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(probability):
+            continue
+        probability = max(0.0, min(1.0, probability))
+        severity = str(finding.get("severity", "MEDIUM")).upper()
+        risk_points += _SEVERITY_RISK_WEIGHTS.get(severity, 35) * probability
+
+    score = max(0, min(100, round(100 - risk_points)))
+    if not findings:
+        risk_level = "No supported issues detected"
+    elif score >= 80:
+        risk_level = "Lower detected risk"
+    elif score >= 50:
+        risk_level = "Moderate detected risk"
+    else:
+        risk_level = "Higher detected risk"
+
+    return {
+        "score": score,
+        "risk_level": risk_level,
+        "findings_considered": len(findings),
+        "scope": "Heuristic based on detected supported CWEs; not a security guarantee.",
+    }
 
 
 def filter_low_confidence(

@@ -8,6 +8,7 @@ import sys
 import json
 import argparse
 import logging
+import re
 import subprocess
 import tempfile
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ir_parser   import parse_ll_file
+from ir_parser   import parse_ll_file, filter_functions_to_source
 from pyg_model   import build_pyg_model
 from pyg_dataset import build_function_graph, NUM_CLASSES
 # --- Constants ---
@@ -69,6 +70,7 @@ RED    = "\033[91m"
 DEFAULT_MODEL     = "results/pyg_gnn_v9/best_pyg_model.pt"
 DEFAULT_SUPPORT   = "dataset/test_case_support"
 DEFAULT_THRESHOLD = 0.5
+COMPILATION_TIMEOUT_SECONDS = 10
 
 
 # --- Pipeline Steps ---
@@ -96,15 +98,65 @@ def compile_to_ll(source_path: Path, support_dir: str) -> str:
     if support_dir and os.path.isdir(support_dir):
         cmd += ["-I", support_dir]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=COMPILATION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        if os.path.exists(ll_path):
+            os.unlink(ll_path)
+        raise TimeoutError(
+            f"Compilation timed out after {COMPILATION_TIMEOUT_SECONDS} seconds."
+        ) from error
+    except OSError:
+        if os.path.exists(ll_path):
+            os.unlink(ll_path)
+        raise
 
     if result.returncode != 0:
-        os.unlink(ll_path)
+        if os.path.exists(ll_path):
+            os.unlink(ll_path)
         raise RuntimeError(
             f"Compilation failed:\n{result.stderr[:500]}"
         )
 
     return ll_path
+
+
+def find_division_by_zero_warnings(
+    source_path: Path, support_dir: str = ""
+) -> list[int]:
+    """Return source line numbers for Clang's constant divide-by-zero warnings."""
+    compiler = "clang++" if source_path.suffix.lower() == ".cpp" else "clang"
+    cmd = [compiler, "-fsyntax-only", "-Wdivision-by-zero", str(source_path)]
+    if support_dir and os.path.isdir(support_dir):
+        cmd += ["-I", support_dir]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=COMPILATION_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Source validation failed:\n{result.stderr[:500]}")
+
+    source_name = os.path.normcase(os.path.normpath(str(source_path)))
+    warning_pattern = re.compile(
+        r"^(.*):(\d+):\d+: warning: division by zero\b.*"
+        r"\[-Wdivision-by-zero\]$"
+    )
+    lines = set()
+    for diagnostic in result.stderr.splitlines():
+        match = warning_pattern.match(diagnostic)
+        if not match:
+            continue
+        diagnostic_source = os.path.normcase(os.path.normpath(match.group(1)))
+        if diagnostic_source == source_name:
+            lines.add(int(match.group(2)))
+    return sorted(lines)
 
 
 def parse_ll(ll_path: str) -> dict:
@@ -404,6 +456,7 @@ def run_model_per_function(ir_data: dict, model, device, threshold: float) -> di
     from pyg_dataset import build_function_graph, instruction_features
     import numpy as np
 
+    ir_data = filter_functions_to_source(ir_data)
     all_probs = []
 
     for func in ir_data.get("functions", []):

@@ -28,9 +28,10 @@
                 <nav class="sidebar-nav">
                     <div class="nav-section">Audit Metrics</div>
                     <div class="stat-row">
-                        <span class="stat-label">Security Index</span>
-                        <span class="stat-value" id="score-number">100</span>
+                        <span class="stat-label">Security estimate / 100</span>
+                        <span class="stat-value" id="score-number">--</span>
                     </div>
+                    <p class="security-note">Higher is lower detected risk; supported patterns only.</p>
                     <div class="stat-row">
                         <span class="stat-label">Analysis Time</span>
                         <span class="stat-value secondary" id="stat-time">0.00s</span>
@@ -73,23 +74,42 @@
             <section class="editor-pane">
                 <header class="pane-header">
                     <div class="header-tab active">
-                        <i data-feather="file-text"></i> source_audit.c
+                        <i data-feather="file-text"></i> <span id="source-filename">source_audit.c</span>
                     </div>
                     <div class="header-actions">
+                        <label class="language-picker" for="code-language">Language
+                            <select id="code-language">
+                                <option value="c">C</option>
+                                <option value="cpp">C++</option>
+                            </select>
+                        </label>
                         <button id="btn-edit" class="icon-btn hidden" title="Back to Edit"><i data-feather="edit-3"></i></button>
                         <button id="btn-clear" class="icon-btn" title="Clear Canvas"><i data-feather="trash-2"></i></button>
                     </div>
                 </header>
                 
                 <div class="editor-content">
-                    <textarea id="code-input" spellcheck="false" placeholder="// Paste C/C++ code here for AI analysis..."></textarea>
+                    <pre id="code-line-numbers" class="line-numbers" aria-hidden="true">1</pre>
+                    <textarea id="code-input" wrap="off" spellcheck="false" placeholder="// Paste C/C++ code here for AI analysis..."></textarea>
                     <div id="code-render-overlay" class="code-overlay hidden">
                         <pre id="code-render"><code></code></pre>
                     </div>
                 </div>
 
+                <section id="live-check-panel" class="live-check-panel" aria-live="polite">
+                    <div class="live-check-heading">
+                        <strong id="live-check-status">Live checks start when you type</strong>
+                        <span id="live-check-detail">Syntax and supported vulnerability checks run locally after a short pause.</span>
+                    </div>
+                    <div id="live-check-findings" class="live-check-findings"></div>
+                </section>
+
                 <footer class="pane-footer">
-                    <div class="footer-hint">⌘ + Enter to analyze</div>
+                    <div class="footer-hint">Ctrl + Enter to analyze</div>
+                    <label class="llm-consent" for="llm-review-consent">
+                        <input id="llm-review-consent" type="checkbox">
+                        <span>Optional LLM review. If enabled, send code up to 64 KB to the configured provider.</span>
+                    </label>
                     <button id="analyze-btn" class="btn-primary">
                         <i data-feather="play"></i> Analyze
                     </button>
@@ -122,6 +142,7 @@
 
                         <div id="state-success" class="success-view hidden">
                             <div id="verdict-banner" class="verdict-card"></div>
+                            <section id="llm-review-result" class="llm-review-card hidden" aria-live="polite"></section>
                             <div class="section-label">Confidence Distribution</div>
                             <div id="prob-list" class="prob-stack"></div>
                             

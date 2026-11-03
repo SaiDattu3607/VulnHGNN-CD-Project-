@@ -66,7 +66,11 @@ def run_healing_loop(
     from localization import localize_vulnerabilities
     from ir_healer import repair_ir
     from validation import validate_repair, run_gnn_redetection
-    from security import validate_ir_input, filter_low_confidence
+    from security import (
+        MAX_SOURCE_SIZE_BYTES,
+        validate_ir_input,
+        validate_source_input,
+    )
 
     CLASS_NAMES = ["non-vulnerable", "CWE-476", "CWE-191", "CWE-190", "CWE-369"]
 
@@ -89,6 +93,20 @@ def run_healing_loop(
     logger.info("Step 1: Compiling %s → LLVM IR ...", source_path.name)
     ll_path = None
     try:
+        if source_path.stat().st_size > MAX_SOURCE_SIZE_BYTES:
+            result["error"] = (
+                f"Source code exceeds the {MAX_SOURCE_SIZE_BYTES}-byte limit."
+            )
+            result["elapsed_sec"] = time.time() - t0
+            return result
+        with open(source_path, "r", encoding="utf-8", errors="replace") as source_file:
+            source_content = source_file.read()
+        is_valid, msg = validate_source_input(source_content)
+        if not is_valid:
+            result["error"] = f"Source validation failed: {msg}"
+            result["elapsed_sec"] = time.time() - t0
+            return result
+
         ll_path = compile_to_ll(source_path, support_dir)
         with open(ll_path, "r", encoding="utf-8", errors="replace") as f:
             original_ir = f.read()
@@ -119,6 +137,7 @@ def run_healing_loop(
             "localization": None,
             "repair": None,
             "validation": None,
+            "agent_decision": "pending",
         }
 
         # ── Step 2: Detect ──────────────────────────────────────────
@@ -127,6 +146,7 @@ def run_healing_loop(
 
         if not detection["success"]:
             iter_result["error"] = f"Detection failed: {detection.get('error')}"
+            iter_result["agent_decision"] = "stop_detection_error"
             result["iterations"].append(iter_result)
             break
 
@@ -138,6 +158,7 @@ def run_healing_loop(
 
         if not detected_cwes:
             logger.info("  ✔ No vulnerabilities detected — code is clean!")
+            iter_result["agent_decision"] = "stop_no_vulnerabilities"
             result["iterations"].append(iter_result)
             result["final_status"] = "CLEAN"
             result["remaining_cwes"] = []
@@ -196,6 +217,7 @@ def run_healing_loop(
 
         if repair_result.get("total_patches", 0) == 0:
             logger.warning("  No patches applied — cannot repair further.")
+            iter_result["agent_decision"] = "stop_no_repair_available"
             result["iterations"].append(iter_result)
             result["final_status"] = "NO_REPAIR_AVAILABLE"
             result["remaining_cwes"] = detected_cwes
@@ -238,22 +260,27 @@ def run_healing_loop(
 
         if new_cwes:
             logger.warning("  ✘ Repair introduced new vulnerabilities: %s", new_cwes)
+            iter_result["agent_decision"] = "stop_repair_introduced_vulnerabilities"
             result["final_status"] = "REPAIR_INTRODUCED_NEW_VULNS"
             result["remaining_cwes"] = list(set(remaining) | set(new_cwes))
             break
 
         if not remaining:
             logger.info("  ✔ All vulnerabilities repaired!")
+            iter_result["agent_decision"] = "stop_verified_clean"
             result["final_status"] = "FULLY_HEALED"
             result["remaining_cwes"] = []
             break
 
         logger.info("  Remaining CWEs: %s — continuing loop...", remaining)
+        iter_result["agent_decision"] = "continue_with_remaining_vulnerabilities"
         result["remaining_cwes"] = remaining
 
     else:
         # Loop exhausted max iterations
         result["final_status"] = "MAX_ITERATIONS_REACHED"
+        if result["iterations"]:
+            result["iterations"][-1]["agent_decision"] = "stop_iteration_limit"
         logger.warning("Max iterations (%d) reached.", max_iterations)
 
     result["patched_ir"] = current_ir

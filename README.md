@@ -7,6 +7,7 @@ VulnHGNN is a tool built to help detect, localize, and fix software vulnerabilit
 - Supports multi-label classification, meaning it can detect multiple types of vulnerabilities at once.
 - Localizes exactly where the vulnerability is in your code.
 - Features self-healing capabilities to automatically suggest and apply fixes.
+- Checks C syntax and supported vulnerability patterns while you type in the web editor, with secure-coding guidance for detected issues.
 - Provides an interactive web UI built with Flask to easily visualize and fix issues.
 - Includes a full CLI pipeline to process source files and generate reports from your terminal.
 - Tracks carbon emissions using CodeCarbon to measure the environmental impact of your ML workloads.
@@ -28,6 +29,22 @@ The easiest way to use VulnHGNN is through the web app. Just double-click the `r
 
 If you prefer doing it manually, you can activate your environment, navigate to the `src` folder, and run `python app.py`.
 
+### Optional LLM Security Review
+The local GNN analysis works without an LLM. To enable the optional review, configure an OpenAI-compatible chat-completions provider on the server before starting Flask:
+
+```powershell
+$env:VULNHGNN_LLM_API_KEY = "<provider API key>"
+$env:VULNHGNN_LLM_MODEL = "<provider model name>"
+# Optional; defaults to the OpenAI chat-completions endpoint.
+$env:VULNHGNN_LLM_API_URL = "https://api.openai.com/v1/chat/completions"
+python src/app.py
+```
+
+In the UI, check **Optional LLM review** to consent to sending the source to that provider. It is unchecked by default, and source over 64 KB is not sent. The provider returns a separate advisory score and findings; it does not control or apply repairs. Review the provider's data-handling policy before sending code.
+
+### Live editor checks
+After a short pause in typing, the web editor compiles the selected C or C++ source with Clang. To avoid false alarms, live security findings are shown only for constant division-by-zero cases Clang can directly confirm; GNN predictions are not shown in the live panel. Other vulnerability types are not confirmed by this live check. Live checks do not send code to an LLM provider and do not modify the source. A clean live check does not prove that code is secure. The separate Analyze action still uses the GNN to estimate supported patterns. Install Clang to use live syntax validation and constant division-by-zero checks.
+
 ### Running the CLI
 If you want to process files directly from the command line, you can use the `run_pipeline.bat` script. By default, it runs a test file against our pre-trained model. 
 
@@ -37,8 +54,7 @@ To run it on your own files, you can manually run the pipeline like this:
 3. Run the script: `python src\pipeline.py path\to\your_file.c --no-carbon --model results\pyg_gnn_v9\best_pyg_model.pt`
 
 ## Folder structure
-- `src/` holds the backend code like the Flask app, pipeline, and models.
-- `data/` and `dataset/` are where the graphs and datasets live.
-- `results/` is where trained models and outputs are saved.
-- `test_files/` has some sample code you can use for testing.
-- `docs/` contains extra documentation.
+
+## Architecture
+See [docs/architecture.md](docs/architecture.md) for the end-to-end architecture, runtime flow, security controls, and bounded self-healing agent cycle.
+Open the [updated architecture diagram PNG](docs/vulnhgnn_full_architecture_with_llm_review.png) directly for presentations.

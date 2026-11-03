@@ -1,11 +1,14 @@
 import re
+import json
+import os
 
 def parse_ll_file(filepath):
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
     source_file = _extract_source_file(lines)
-    functions   = _extract_functions(lines)
+    debug_files, debug_functions = _extract_debug_metadata(lines)
+    functions   = _extract_functions(lines, debug_functions)
 
     return {
         "source_file": source_file,
@@ -15,10 +18,70 @@ def parse_ll_file(filepath):
 def _extract_source_file(lines):
     for line in lines:
         if line.startswith("source_filename"):
-            match = re.search(r'"(.+)"', line)
+            match = re.search(r'"((?:\\.|[^"\\])*)"', line)
             if match:
-                return match.group(1)
+                return _decode_llvm_string(match.group(1))
     return ""
+
+
+def _decode_llvm_string(value):
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return value
+
+
+def _extract_debug_metadata(lines):
+    debug_files = {}
+    debug_functions = {}
+
+    for line in lines:
+        file_match = re.search(
+            r'!(\d+)\s*=\s*!DIFile\(filename:\s*"((?:\\.|[^"\\])*)",'
+            r'\s*directory:\s*"((?:\\.|[^"\\])*)"',
+            line,
+        )
+        if file_match:
+            file_id, filename, directory = file_match.groups()
+            filename = _decode_llvm_string(filename)
+            directory = _decode_llvm_string(directory)
+            debug_files[file_id] = os.path.normpath(
+                os.path.join(directory, filename) if directory else filename
+            )
+
+    for line in lines:
+        subprogram_match = re.search(
+            r'!(\d+)\s*=\s*(?:distinct\s+)?!DISubprogram\((.*)\)',
+            line,
+        )
+        if subprogram_match:
+            subprogram_id, metadata = subprogram_match.groups()
+            file_match = re.search(r'\bfile:\s*!(\d+)', metadata)
+            if file_match:
+                file_id = file_match.group(1)
+                debug_functions[subprogram_id] = debug_files.get(file_id)
+
+    return debug_files, debug_functions
+
+
+def filter_functions_to_source(ir_data):
+    """Keep functions whose debug source location belongs to this input file."""
+    source_file = ir_data.get("source_file")
+    functions = ir_data.get("functions", [])
+    if not source_file or not any(func.get("source_file") for func in functions):
+        return ir_data
+
+    source_path = os.path.normcase(os.path.normpath(source_file))
+    filtered = {
+        **ir_data,
+        "functions": [
+            func for func in functions
+            if func.get("source_file")
+            and os.path.normcase(os.path.normpath(func["source_file"])) == source_path
+        ],
+        "source_filter_applied": True,
+    }
+    return filtered
 
 
 
@@ -40,9 +103,10 @@ _DECLARE_RE = re.compile(
 
 _BLOCK_LABEL_RE = re.compile(r'^(\d+|[\w\.]+):\s*(?:;.*)?$')
 
-def _extract_functions(lines):
+def _extract_functions(lines, debug_functions=None):
     functions = []
     i = 0
+    debug_functions = debug_functions or {}
 
     while i < len(lines):
         line = lines[i].strip()
@@ -66,6 +130,11 @@ def _extract_functions(lines):
             ret_type   = m.group(1)
             func_name  = m.group(2)
             params_raw = m.group(3)
+            debug_match = re.search(r'!dbg\s+!(\d+)', line)
+            source_file = (
+                debug_functions.get(debug_match.group(1))
+                if debug_match else None
+            )
 
             #collect the body lines until the closing '}'
             body_lines = []
@@ -85,6 +154,7 @@ def _extract_functions(lines):
                 "params":         _parse_params(params_raw),
                 "is_declaration": False,
                 "blocks":         blocks,
+                "source_file":    source_file,
             })
             continue
 
