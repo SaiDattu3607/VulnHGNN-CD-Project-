@@ -8,6 +8,11 @@ __pycache__/
 .vscode/
 .idea/
 
+# Local secrets
+.env
+.env.*
+!.env.example
+
 # Data, datasets, databases, and cached stuff
 data/
 dataset/

@@ -150,8 +150,7 @@ body {
 
 .pane-footer { padding: 0.75rem 1.5rem; background: var(--bg-sidebar); border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.75rem; }
 .footer-hint { font-size: 0.7rem; color: var(--text-dim); }
-.llm-consent { flex: 1 1 220px; display: flex; align-items: flex-start; gap: 0.5rem; font-size: 0.68rem; line-height: 1.4; color: var(--text-secondary); cursor: pointer; }
-.llm-consent input { flex: 0 0 auto; margin: 0.1rem 0 0; accent-color: var(--accent); }
+.llm-consent { flex: 1 1 220px; margin: 0; font-size: 0.68rem; line-height: 1.4; color: var(--text-secondary); }
 
 .btn-primary {
     background: var(--accent); color: #000; border: none; padding: 6px 16px; border-radius: 4px; font-weight: 700; font-size: 0.75rem; cursor: pointer; display: flex; align-items: center; gap: 6px;
@@ -212,6 +211,7 @@ body {
 .btn-sec:hover { background: #222; border-color: var(--text-dim); }
 .btn-sec svg { width: 14px; }
 .btn-sec.full { grid-column: span 2; background: var(--accent-glow); color: var(--accent); border-color: rgba(79, 172, 254, 0.3); }
+.report-export { width: 100%; margin: 0 0 1.5rem; }
 
 /* LOCALIZATION STACK */
 .inst-stack { display: flex; flex-direction: column; gap: 10px; }
@@ -226,6 +226,8 @@ body {
 .diff-tag { font-size: 0.6rem; font-weight: 800; text-transform: uppercase; padding: 4px 10px; background: #222; color: var(--text-dim); border-bottom: 1px solid var(--border); }
 .diff-tag.healed { background: rgba(0, 255, 136, 0.1); color: var(--success); }
 .diff-block pre { padding: 10px; font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); max-height: 200px; overflow: auto; margin: 0; }
+.repair-review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 1rem; }
+.repair-review-actions p { flex: 1 1 100%; color: var(--text-secondary); font-size: 0.72rem; line-height: 1.45; }
 
 /* LOG CONSOLE */
 .log-console { background: #000; padding: 1rem; border-radius: 4px; font-family: var(--font-mono); font-size: 11px; height: 350px; overflow-y: auto; color: #666; }

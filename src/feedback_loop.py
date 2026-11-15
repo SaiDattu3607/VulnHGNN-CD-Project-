@@ -60,7 +60,7 @@ def run_healing_loop(
     Returns:
         dict with full pipeline results including repair log
     """
-    from predict import compile_to_ll, CLASS_THRESHOLDS
+    from predict import compile_to_ll, validate_ir_with_clang
     from ir_parser import parse_ll_file
     from pyg_dataset import build_function_graph, NUM_CLASSES
     from localization import localize_vulnerabilities
@@ -223,8 +223,37 @@ def run_healing_loop(
             result["remaining_cwes"] = detected_cwes
             break
 
-        result["total_patches"] += repair_result["total_patches"]
         patched_ir = repair_result["patched_ir"]
+        if not repair_result.get("is_valid", False):
+            iter_result["agent_decision"] = "stop_invalid_repair"
+            result["iterations"].append(iter_result)
+            result["final_status"] = "INVALID_REPAIR"
+            result["remaining_cwes"] = detected_cwes
+            break
+
+        try:
+            compiler_validation = validate_ir_with_clang(patched_ir)
+        except (OSError, TimeoutError) as error:
+            logger.exception("Could not verify patched LLVM IR with Clang.")
+            iter_result["repair"]["compiler_validation"] = {
+                "valid": False,
+                "diagnostics": str(error),
+            }
+            iter_result["agent_decision"] = "stop_repair_validation_unavailable"
+            result["iterations"].append(iter_result)
+            result["final_status"] = "REPAIR_VALIDATION_UNAVAILABLE"
+            result["remaining_cwes"] = detected_cwes
+            break
+
+        iter_result["repair"]["compiler_validation"] = compiler_validation
+        if not compiler_validation["valid"]:
+            iter_result["agent_decision"] = "stop_invalid_repair"
+            result["iterations"].append(iter_result)
+            result["final_status"] = "INVALID_REPAIR"
+            result["remaining_cwes"] = detected_cwes
+            break
+
+        result["total_patches"] += repair_result["total_patches"]
 
         # ── Step 5: Validate ────────────────────────────────────────
         logger.info("  [Validate] Verifying repair...")

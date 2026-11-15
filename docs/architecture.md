@@ -1,12 +1,22 @@
 # VulnHGNN Architecture
 
-![VulnHGNN full system architecture with optional LLM review](vulnhgnn_full_architecture_with_llm_review.png)
+![Updated VulnHGNN architecture, styled like the original phase-based diagram](vulnhgnn_updated_architecture.png)
+
+## What changed from the original
+
+| Area | Before | Now | How it helps |
+|---|---|---|---|
+| Web detection | Full detection used the local GNN. | Full web analysis now uses the configured Gemini agent plus local Clang checks. Live checks while typing stay local and do not call Gemini. | Replaces the GNN as the web app's primary detector while avoiding API calls on each keystroke. Gemini results are advisory, not proof. |
+| Detection reliability | A source-path mismatch could remove user functions and return misleading zero scores. | Source paths are normalized, and empty analysis or inference failures return an explicit error. | Avoids showing a false “clean” result when analysis did not actually run. |
+| Repair flow | A repair could be treated as ready without a clear review step. | Repairs are compiler-checked; source proposals are shown as a diff with Apply and Discard controls. | Rejects proposals that do not compile and leaves the user in control. Compilation does not prove a repair is safe or correct. |
+| Agent loop | Detection and repair steps did not clearly expose why the loop stopped. | The bounded repair loop records whether it stops, continues, or reaches an error or limit. | Makes the repair result easier to follow and prevents an open-ended repair cycle. |
+| Training split | Functions from one source file could be split across training and evaluation. | The split groups functions by source file. | Reduces file-level data leakage. The current checkpoint was not retrained, and fixture metrics are not a held-out benchmark. |
+
+The web app's primary detector is now Gemini plus Clang. The legacy CLI, graph construction, GNN localization, and GNN-based repair pipeline remain available and are not replaced by this web-only change. The agent review does not execute code or apply repairs. Full web analysis sends source (up to 64 KB) to the configured provider on each Analyze action; live editor checks remain local.
 
 ## System Overview
 
-VulnHGNN accepts C/C++ source through either the Flask web application or the command-line pipeline. The source is checked, compiled to LLVM IR, parsed into function-level representations and graphs, and scored by the trained VulnGAT model. Detection results can be localized and passed to the IR repair engine. A bounded feedback loop re-runs detection on the patched IR and reports the outcome.
-
-The web interface also offers a separate, optional LLM security review. It is off by default, requires explicit user consent, and sends source only to a provider configured by the server operator. Its advisory score and findings are kept separate from the local GNN result; the LLM cannot invoke repair tools.
+The web app validates and compiles C/C++ source with Clang, runs local constant division-by-zero checks, and sends full-analysis source to the configured Gemini agent. A successful response supplies the advisory score and findings; if Gemini is unavailable, the endpoint returns an explicit error instead of falling back to GNN predictions. The CLI and legacy repair pipeline still compile source to LLVM IR, construct graphs, and use the trained GNN; patched IR is compiler-checked before GNN re-detection. Source repair proposals require explicit user review before changing editor content.
 
 ```mermaid
 flowchart TB
@@ -17,34 +27,29 @@ flowchart TB
         UI --> API
     end
 
-    subgraph Guard[Input and Runtime Safeguards]
+    subgraph Guard[Input Safeguards]
         HTTP[Flask request size cap]
         SRC[Source validation<br/>empty, NUL, 1 MB limit]
-        IR[LLVM IR validation<br/>size, structure, suspicious patterns]
-        HEALTH[Model stability check<br/>NaN/Inf parameters]
     end
 
-    subgraph Front[Source Processing]
-        COMP[Clang compile<br/>C/C++ to LLVM IR]
+    subgraph Web[Web Detection]
+        COMP[Clang syntax validation<br/>and local security checks]
+        LIVE[Debounced live checks<br/>local only; no Gemini request]
+        REVIEW[Gemini agent review<br/>full analysis; max 64 KB]
+        RESULT[Agent findings + Clang diagnostics<br/>advisory; not proof of security]
+        COMP --> LIVE
+        REVIEW --> RESULT
+        COMP --> RESULT
+    end
+
+    subgraph Legacy[Legacy CLI and Repair Pipeline]
+        IR[LLVM IR validation<br/>size, structure, suspicious patterns]
         PARSE[LLVM IR parser<br/>functions, blocks, instructions]
         GRAPH[Graph builder<br/>instruction nodes + code-flow edges]
         FEAT[Instruction and graph features]
-    end
-
-    subgraph ML[Detection and Localization]
         MODEL[Trained VulnGAT / GNN]
         PRED[Multi-label CWE predictions<br/>confidence thresholds]
         LOC[Localization<br/>attention and gradient/node scores]
-    end
-
-    subgraph OptionalLLM[Optional External Review - Web Only]
-        CONSENT[User consent checkbox<br/>off by default; max 64 KB]
-        REVIEW[LLM security review<br/>server-side provider key]
-        LLMRESULT[Separate advisory score<br/>and evidence-backed findings]
-        CONSENT --> REVIEW --> LLMRESULT
-    end
-
-    subgraph Agent[Bounded Self-Healing Agent Loop]
         PLAN[Choose next action from detections]
         REPAIR[Rule-based LLVM IR repair]
         VERIFY[Re-detect and validate repair]
@@ -52,50 +57,40 @@ flowchart TB
         PLAN --> REPAIR --> VERIFY --> DECIDE
         DECIDE -->|Vulnerabilities remain; iterations left| PLAN
         DECIDE -->|Clean, no repair, new issue, error, or limit| REPORT
+        IR --> PARSE --> GRAPH --> FEAT --> MODEL --> PRED
+        PRED --> LOC --> PLAN
     end
 
     subgraph Output[Results and Observability]
         REPORT[JSON result and repair log]
-        ESTIMATE[Local GNN risk estimate]
         PATCH[Patched LLVM IR output]
         CARBON[Optional CodeCarbon metrics]
-        WEB[API response and UI presentation]
-        REPORT --> WEB
+        WEB[Web API response and UI]
         REPORT --> PATCH
         REPORT --> CARBON
     end
 
-    subgraph Offline[Offline Model Development]
-        DATA[Training / evaluation data]
-        TRAIN[Training and evaluation scripts]
-        CKPT[Model checkpoint<br/>results/pyg_gnn_v9]
-        DATA --> TRAIN --> CKPT --> MODEL
-    end
-
     API --> HTTP --> SRC
+    SRC --> COMP
+    SRC -->|Analyze action| REVIEW
+    RESULT --> WEB
     CLI --> SRC
-    SRC --> COMP --> IR --> PARSE --> GRAPH --> FEAT --> MODEL
-    SRC -->|explicit opt-in only| CONSENT
-    MODEL --> PRED
-    PRED --> WEB
-    PRED --> ESTIMATE --> WEB
-    LLMRESULT --> WEB
-    PRED --> LOC --> PLAN
-    HEALTH -. checks loaded model .-> MODEL
+    SRC -->|CLI / legacy pipeline| IR
+    REPORT --> WEB
 ```
 
 ## Runtime Flow
 
-1. **Submit source:** A user submits C/C++ in the web UI or selects a file through the CLI.
-2. **Apply input safeguards:** The Flask app imposes a request-body cap. Shared source validation rejects empty text, NUL bytes, and source larger than 1 MB before it is written for compilation. The healing loop repeats source validation before invoking the compiler, protecting the CLI path as well.
-3. **Compile and validate IR:** Clang produces LLVM IR. The security module checks the IR's size, basic structure, function count, brace balance, and configured suspicious assembly patterns.
-4. **Represent code as a graph:** The IR parser extracts functions, basic blocks, and instructions. Graph-building and feature code converts these into model input.
-5. **Detect and localize:** The trained GNN predicts supported CWE classes. Localization scores instructions associated with detected classes.
-6. **Repair and verify:** The repair engine applies available rule-based IR patches. The validation stage runs GNN re-detection and checks whether new vulnerability classes appeared.
-7. **Optional LLM review:** In the web UI only, a user may explicitly opt in to send source no larger than 64 KB to the configured provider. The provider returns a separate advisory score and findings; the code is not executed and the LLM cannot apply repairs. Without provider configuration or consent, no source is sent.
-8. **Decide and return artifacts:** The existing repair loop stops when no vulnerabilities remain, no repair is available, validation identifies a newly introduced issue, an error occurs, or the iteration limit is reached. API callers may request 1-5 iterations; the default is 5. Each iteration records an `agent_decision`. Reports, patched IR, the local GNN estimate, optional LLM review, and optional carbon metrics are returned separately.
+1. **Submit source:** A user submits C/C++ through the web UI or selects a file through the CLI.
+2. **Real-time editor checks:** While typing, the browser debounces requests and cancels stale checks. Clang validates syntax and checks for constant division-by-zero warnings; live checks never call Gemini.
+3. **Apply input safeguards:** The Flask app imposes a request-body cap. Shared source validation rejects empty text, NUL bytes, and source larger than 1 MB before it is written for compilation. The healing loop repeats source validation before invoking the compiler, protecting the CLI path as well.
+4. **Compile and validate IR:** Clang produces LLVM IR. The security module checks the IR's size, basic structure, function count, brace balance, and configured suspicious assembly patterns.
+5. **Full web analysis:** Pressing Analyze sends source up to 64 KB to the configured Gemini provider on every request. Gemini findings are advisory; if review is unavailable, the endpoint fails explicitly rather than using the GNN as a fallback.
+6. **Legacy CLI detection:** The CLI compiles to LLVM IR, builds function graphs, and uses the existing GNN for supported CWE prediction and localization.
+7. **Legacy repair and verification:** The repair pipeline applies available rule-based IR patches. Clang compiles patched IR before GNN re-detection. Source repair proposals are compiler-checked and require explicit user review before changing editor content. Compilation confirms syntax/IR validity only, not that a repair is semantically correct or secure.
+8. **Export audit evidence:** After web analysis, the browser can download agent findings, Clang checks, the agent score, and scope disclaimer as JSON. The report is assembled locally; the source is sent to the configured provider only for the full Analyze request. Editing source or changing languages invalidates the displayed report.
 
-## Agent Decision Cycle
+## Legacy GNN-Based Repair Cycle
 
 ```mermaid
 sequenceDiagram
@@ -131,14 +126,14 @@ sequenceDiagram
     end
 ```
 
-**LLM scope:** The optional LLM is a source-code reviewer, not an autonomous repair agent. It has no tools and cannot execute code or change files. The bounded healing loop remains deterministic and uses the GNN, repair rules, and validator; its `agent_decision` field records loop decisions.
+**Gemini scope:** The web agent reviews source and returns advisory findings; it has no tools, cannot execute code, and cannot change files. Every full web analysis sends source (up to 64 KB) to the configured provider. The bounded legacy repair loop remains deterministic and uses the GNN, repair rules, and validator; its `agent_decision` field records loop decisions.
 
 ## Component Map
 
 | Concern | Main implementation |
 |---|---|
 | Web interface and API | `src/app.py`, `src/templates/`, `src/static/` |
-| Optional external LLM review | `src/llm_security_review.py` |
+| Gemini agent review for full web analyses | `src/llm_security_review.py` |
 | CLI orchestration and result files | `src/pipeline.py` |
 | Source and LLVM IR security checks; model diagnostics | `src/security.py` |
 | Compile, detect, localize, repair, and validate iteration loop | `src/feedback_loop.py` |
@@ -155,14 +150,18 @@ sequenceDiagram
 
 | Area | Existing project | Recent addition |
 |---|---|---|
-| Detection workflow | Flask UI/API and CLI; C/C++ compilation; graph-based multi-label CWE detection | Shared source validation now runs before source compilation in API and healing-loop paths |
+| Web detection workflow | Flask UI/API with GNN detection | Full web analysis uses Gemini plus Clang; Gemini failure is explicit and does not fall back to GNN |
+| Legacy CLI and repair | CLI and bounded GNN-based repair pipeline | Shared source validation; source file path matching handles relative and absolute compiler paths; no analyzable graph is an explicit error |
+| Real-time editor checks | Browser editor with a debounced local check | Local Clang syntax validation and constant division-by-zero warnings; no Gemini call while typing |
 | Input security | Flask request-size cap and LLVM IR validation | Source text rejects empty input and NUL bytes and has a 1 MB cap |
 | Self-healing | Rule-based IR repair followed by GNN re-detection and new-CWE checks | Iteration output records why the bounded loop continues or stops |
 | Resource control | Healing loop has an iteration limit | API validates `max_iterations` as an integer from 1 through 5 |
 | Model/runtime checks | Model stability helper and CLI pipeline stability check | No claim that model-health checks are applied to every web request |
 | Web runtime | Local Flask UI/API | Flask debug mode is disabled when started directly |
-| Optional LLM review | Not present | User-opted-in provider review with separate score; disabled unless configured |
+| Gemini web review | Optional advisory | Runs on every full web analysis when configured; API errors explicitly if no review is available |
+| Audit evidence | Results shown in the UI | Downloadable JSON report containing agent findings, Clang checks, agent score, timestamp, and disclaimer |
+| Model evaluation split | Function graphs were randomly split, allowing functions from one file to cross splits | Training splits function graphs by originating source file; a diagnostic-fixture runner records metrics while warning it is not an independent benchmark |
 
 ## Security Scope
 
-These safeguards reduce accidental or oversized input and provide basic validation before parsing and compilation. The optional LLM path sends source outside the application only after explicit user consent, only when provider credentials are configured, and only for inputs up to 64 KB. Review the provider's retention and training policies before sending proprietary code. LLM results are untrusted advice, not proof of security. These safeguards do not make the application a hardened multi-user service by themselves. If deployed beyond a local demo, add authentication and authorization, rate limiting, isolated/time-limited compiler execution, restricted filesystem access, production-grade server configuration, and operational logging/monitoring.
+These safeguards reduce accidental or oversized input and provide basic validation before parsing and compilation. Each full web analysis sends source outside the application to the configured Gemini provider (up to 64 KB); review the provider's retention and training policies before sending proprietary code. Gemini results are untrusted advice, not proof of security. Live checks remain local. These safeguards do not make the application a hardened multi-user service by themselves. If deployed beyond a local demo, add authentication and authorization, rate limiting, isolated/time-limited compiler execution, restricted filesystem access, production-grade server configuration, and operational logging/monitoring.

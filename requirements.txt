@@ -11,6 +11,7 @@ networkx
 
 # Web server
 flask
+python-dotenv>=1.0
 
 # Utilities
 tqdm

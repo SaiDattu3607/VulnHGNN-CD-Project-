@@ -71,13 +71,15 @@ def filter_functions_to_source(ir_data):
     if not source_file or not any(func.get("source_file") for func in functions):
         return ir_data
 
-    source_path = os.path.normcase(os.path.normpath(source_file))
+    source_path = os.path.normcase(os.path.abspath(os.path.normpath(source_file)))
     filtered = {
         **ir_data,
         "functions": [
             func for func in functions
             if func.get("source_file")
-            and os.path.normcase(os.path.normpath(func["source_file"])) == source_path
+            and os.path.normcase(
+                os.path.abspath(os.path.normpath(func["source_file"]))
+            ) == source_path
         ],
         "source_filter_applied": True,
     }

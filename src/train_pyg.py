@@ -311,6 +311,62 @@ def balance_dataset(data_list: list, max_ratio: float = 3.0) -> list:
                 len(vuln), n_keep, len(balanced))
     return balanced
 
+
+def split_by_source_file(
+    graph_paths: list[Path],
+    test_fraction: float = 0.2,
+    validation_fraction: float = 0.1,
+    seed: int = RANDOM_SEED,
+) -> tuple[list[int], list[int], list[int], dict[str, list[str]]]:
+    """Split function graphs by originating file to prevent source leakage."""
+    if not 0 < test_fraction < 1 or not 0 < validation_fraction < 1:
+        raise ValueError("Split fractions must be between 0 and 1.")
+    if test_fraction + validation_fraction >= 1:
+        raise ValueError("Test and validation fractions must sum to less than 1.")
+
+    groups: dict[str, list[int]] = {}
+    for index, graph_path in enumerate(graph_paths):
+        source_name = graph_path.name.rsplit("__", 1)[0]
+        groups.setdefault(source_name, []).append(index)
+
+    source_names = sorted(groups)
+    if len(source_names) < 3:
+        raise ValueError(
+            "At least three distinct source files are required for separate "
+            "train, validation, and test splits."
+        )
+
+    rng = np.random.default_rng(seed)
+    shuffled_sources = list(rng.permutation(source_names))
+    test_count = max(1, round(len(source_names) * test_fraction))
+    validation_count = max(1, round(len(source_names) * validation_fraction))
+    while test_count + validation_count >= len(source_names):
+        if validation_count > 1:
+            validation_count -= 1
+        elif test_count > 1:
+            test_count -= 1
+        else:
+            raise ValueError("Not enough distinct source files for all data splits.")
+
+    test_sources = shuffled_sources[:test_count]
+    validation_sources = shuffled_sources[test_count:test_count + validation_count]
+    train_sources = shuffled_sources[test_count + validation_count:]
+
+    def indices_for(sources: list[str]) -> list[int]:
+        return [index for source in sources for index in groups[source]]
+
+    split_sources = {
+        "train": sorted(train_sources),
+        "validation": sorted(validation_sources),
+        "test": sorted(test_sources),
+    }
+    return (
+        indices_for(train_sources),
+        indices_for(validation_sources),
+        indices_for(test_sources),
+        split_sources,
+    )
+
 # ════════════════════════════════════════════════════════════════════════
 # 5. MAIN
 # ════════════════════════════════════════════════════════════════════════
@@ -330,19 +386,17 @@ def run(args):
     dataset = IRGraphDataset(args.json_dir, cache_dir=args.cache_dir)
     logger.info("Total graphs: %d", len(dataset))
 
-    # ── Train/val/test split ─────────────────────────────────────────
-    n       = len(dataset)
-    indices = torch.randperm(n, generator=torch.Generator().manual_seed(RANDOM_SEED)).tolist()
-
-    n_test  = int(n * 0.20)
-    n_val   = int(n * 0.10)
-    n_train = n - n_test - n_val
-
-    train_idx = indices[:n_train]
-    val_idx   = indices[n_train:n_train + n_val]
-    test_idx  = indices[n_train + n_val:]
-
-    logger.info("Split: train=%d  val=%d  test=%d", n_train, n_val, n_test)
+    # ── Grouped train/validation/test split ────────────────────────────
+    train_idx, val_idx, test_idx, split_sources = split_by_source_file(
+        dataset._graph_paths,
+    )
+    logger.info(
+        "File-grouped split: train=%d graphs/%d files, validation=%d graphs/%d files, "
+        "test=%d graphs/%d files",
+        len(train_idx), len(split_sources["train"]),
+        len(val_idx), len(split_sources["validation"]),
+        len(test_idx), len(split_sources["test"]),
+    )
 
     # ── Optional augmentation on training set ────────────────────────
     train_data = [dataset[i] for i in train_idx]
@@ -456,6 +510,8 @@ def run(args):
         "model":       "VulnGAT (GATv2 + def-use + CFG edges)",
         "best_epoch":  best_epoch,
         "best_val_f1": round(best_val_f1, 4),
+        "split_strategy": "source_file_grouped",
+        "split_sources": split_sources,
         "augmented":   args.augment,
         "threshold":   args.threshold,
         "metrics":     metrics,

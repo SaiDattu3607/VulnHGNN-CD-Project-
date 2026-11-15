@@ -10,7 +10,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const codeRender = $('code-render');
     const codeOverlay = $('code-render-overlay');
     const analyzeBtn = $('analyze-btn');
-    const llmReviewConsent = $('llm-review-consent');
     const liveCheckPanel = $('live-check-panel');
     const liveCheckStatus = $('live-check-status');
     const liveCheckDetail = $('live-check-detail');
@@ -34,16 +33,23 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnLocalize = $('btn-localize');
     const btnHeal = $('btn-heal-source');
     const btnPipeline = $('btn-pipeline');
+    const btnExportReport = $('btn-export-report');
 
     // Sub-Views
     const locInstructions = $('loc-instructions');
     const healHeader = $('heal-header');
     const diffBefore = $('diff-before');
     const diffAfter = $('diff-after');
+    const repairReviewActions = $('repair-review-actions');
+    const repairValidationStatus = $('repair-validation-status');
+    const btnApplyRepair = $('btn-apply-repair');
+    const btnDiscardRepair = $('btn-discard-repair');
     const logContainer = $('log-container');
 
     let currentCode = '';
     let detectedCWEs = [];
+    let currentAuditReport = null;
+    let pendingRepair = null;
     let liveCheckTimer = null;
     let liveCheckController = null;
     let liveCheckRevision = 0;
@@ -107,37 +113,47 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (security.status === 'unavailable') {
-            liveCheckPanel.dataset.state = 'valid';
-            liveCheckStatus.textContent = 'Valid C syntax; security analysis unavailable';
-            liveCheckDetail.textContent = security.message || 'The local vulnerability model is not loaded.';
-            return;
+            const confirmedFindings = (security.findings || []).filter(
+                finding => finding.severity.includes('CLANG CONFIRMED')
+            );
+            liveCheckPanel.dataset.state = confirmedFindings.length ? 'issues' : 'valid';
+            liveCheckStatus.textContent = confirmedFindings.length
+                ? `Clang confirmed ${confirmedFindings.length} issue(s)`
+                : 'Valid C syntax; security checks unavailable';
+            liveCheckDetail.textContent = security.scope || security.message || 'Local security checks could not complete.';
+        } else {
+            const confirmedCount = (security.findings || []).filter(
+                finding => finding.severity.includes('CLANG CONFIRMED')
+            ).length;
+            liveCheckPanel.dataset.state = confirmedCount ? 'issues' : 'valid';
+            liveCheckStatus.textContent = confirmedCount
+                ? `Clang confirmed ${confirmedCount} constant division-by-zero issue(s)`
+                : 'Clang found no supported constant division-by-zero warnings';
+            liveCheckDetail.textContent = security.scope || 'Live checks are local and do not guarantee that code is secure.';
         }
 
         const findings = security.findings || [];
-        liveCheckPanel.dataset.state = findings.length ? 'issues' : 'valid';
-        liveCheckStatus.textContent = findings.length
-            ? `${findings.length} definite issue(s) reported by Clang`
-            : 'Valid syntax; no definite issue found by this live check';
-        liveCheckDetail.textContent = findings.length
-            ? 'Clang identified a constant division by zero in your source.'
-            : (security.scope || 'This check only reports issues it can verify; it does not prove the code is secure.');
-
         findings.forEach(finding => {
             const card = document.createElement('article');
             card.className = 'live-check-finding';
             const heading = document.createElement('strong');
             heading.textContent = `${finding.severity || 'Review'} · ${finding.class}: ${finding.name}`;
             card.appendChild(heading);
+            if (finding.probability !== null && finding.probability !== undefined) {
+                const confidence = document.createElement('p');
+                confidence.textContent = `Model confidence: ${(finding.probability * 100).toFixed(1)}% (prediction, not confirmation).`;
+                card.appendChild(confidence);
+            }
             if (finding.function) {
                 const location = document.createElement('p');
                 location.textContent = `Function: ${finding.function}`;
                 card.appendChild(location);
             }
-            if (finding.line) {
+            (finding.lines || []).forEach(line => {
                 const location = document.createElement('p');
-                location.textContent = `Line: ${finding.line}`;
+                location.textContent = `Clang-confirmed line: ${line}`;
                 card.appendChild(location);
-            }
+            });
             const recommendation = document.createElement('p');
             recommendation.textContent = finding.recommendation;
             card.appendChild(recommendation);
@@ -173,7 +189,7 @@ document.addEventListener('DOMContentLoaded', () => {
         liveCheckTimer = window.setTimeout(async () => {
             const controller = new AbortController();
             liveCheckController = controller;
-            liveCheckDetail.textContent = 'Running local Clang and model checks…';
+            liveCheckDetail.textContent = 'Running local Clang syntax and security checks…';
             try {
                 const response = await fetch('/api/live-check', {
                     method: 'POST',
@@ -198,12 +214,59 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 1000);
     }
 
+    function invalidateAuditReport() {
+        currentAuditReport = null;
+        btnExportReport.classList.add('hidden');
+    }
+
+    function discardRepairProposal() {
+        pendingRepair = null;
+        repairReviewActions.classList.add('hidden');
+    }
+
+    function downloadAuditReport() {
+        if (!currentAuditReport) return;
+        const report = new Blob(
+            [JSON.stringify(currentAuditReport, null, 2)],
+            { type: 'application/json' }
+        );
+        const url = URL.createObjectURL(report);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `vulnhgnn-security-report-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
     // ═══ EVENTS ═══
     tabBtns.forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
-    codeInput.addEventListener('input', scheduleLiveCheck);
+    codeInput.addEventListener('input', () => {
+        invalidateAuditReport();
+        discardRepairProposal();
+        scheduleLiveCheck();
+    });
     codeInput.addEventListener('input', updateLineNumbers);
+    btnExportReport.addEventListener('click', downloadAuditReport);
+    btnApplyRepair.addEventListener('click', () => {
+        if (!pendingRepair) return;
+        codeInput.value = pendingRepair;
+        discardRepairProposal();
+        invalidateAuditReport();
+        updateLineNumbers();
+        setEditorMode('edit');
+        scheduleLiveCheck();
+        healHeader.textContent = 'Reviewed repair applied to the editor.';
+    });
+    btnDiscardRepair.addEventListener('click', () => {
+        discardRepairProposal();
+        healHeader.textContent = 'Repair proposal discarded; the source was not changed.';
+    });
     codeInput.addEventListener('scroll', updateLineNumbers);
     codeLanguage.addEventListener('change', () => {
+        invalidateAuditReport();
+        discardRepairProposal();
         sourceFilename.textContent = codeLanguage.value === 'cpp' ? 'source_audit.cpp' : 'source_audit.c';
         currentCode = '';
         detectedCWEs = [];
@@ -211,6 +274,8 @@ document.addEventListener('DOMContentLoaded', () => {
         scheduleLiveCheck();
     });
     $('btn-clear').addEventListener('click', () => {
+        invalidateAuditReport();
+        discardRepairProposal();
         codeInput.value = '';
         updateLineNumbers();
         currentCode = '';
@@ -229,6 +294,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!code) return;
 
         currentCode = code;
+        invalidateAuditReport();
+        discardRepairProposal();
         detectedCWEs = [];
         actionDock.classList.add('hidden');
         showState('state', 'loading');
@@ -236,23 +303,14 @@ document.addEventListener('DOMContentLoaded', () => {
         statusText.textContent = 'Analyzing...';
 
         try {
-            const requestLlmReview = llmReviewConsent.checked;
-            const demo = window.getDemoResults ? window.getDemoResults(code) : null;
-            let data;
-            
-            if (demo && !requestLlmReview) {
-                await new Promise(r => setTimeout(r, 1200));
-                data = demo.analysis;
-            } else {
-                const response = await fetch('/api/analyze', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ code: code, language: codeLanguage.value, llm_review: requestLlmReview })
-                });
-                data = await response.json();
-            }
+            const response = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: code, language: codeLanguage.value })
+            });
+            const data = await response.json();
 
-            if (data.success) {
+            if (response.ok && data.success) {
                 renderResults(data, code);
                 showState('state', 'success');
                 statusDot.className = 'status-dot done';
@@ -297,52 +355,87 @@ document.addEventListener('DOMContentLoaded', () => {
         statLoc.textContent = lines;
 
         const preds = data.predictions || [];
-        const detected = preds.filter(p => p.detected && p.class !== 'non-vulnerable');
-        detectedCWEs = detected.map(p => p.class);
+        const detected = preds.filter(p => p.detected);
+        detectedCWEs = data.detected_cwes || [];
 
         const estimate = getSecurityEstimate(preds, data.security_estimate);
-        renderLlmReview(data.llm_review);
+        renderLlmReview(data.agent_review);
+        currentAuditReport = {
+            report_type: 'VulnHGNN agent-assisted security analysis',
+            generated_at: new Date().toISOString(),
+            filename: sourceFilename.textContent,
+            language: codeLanguage.value,
+            analysis_time_seconds: data.elapsed,
+            security_estimate: estimate,
+            detected_findings: detected.map(({ class: cwe, title, probability, severity, line, source, evidence, recommendation }) => ({
+                cwe: cwe.startsWith('CWE-') ? cwe : null,
+                title,
+                confidence: probability,
+                severity: severity || null,
+                line: line || null,
+                source: source || null,
+                evidence: evidence || null,
+                recommendation: recommendation || null,
+            })),
+            findings: preds,
+            security_checks: data.security_checks || {},
+            disclaimer: 'Gemini findings are AI-generated review advice and Clang confirms only the checks listed. Neither a clean result nor compiler success proves code is secure.',
+        };
+        btnExportReport.classList.remove('hidden');
         const score = estimate.score;
         scoreNumber.textContent = score;
         scoreNumber.style.color = score > 80 ? 'var(--success)' : (score > 50 ? 'var(--warning)' : 'var(--danger)');
 
-        // Verdict Card
         const banner = $('verdict-banner');
-        if (detected.length > 0) {
-            banner.className = 'verdict-card vuln';
-            banner.innerHTML = `<h4>${estimate.risk_level}</h4><p>${detected.length} supported issue(s) detected. Estimate: ${score}/100; review findings before repair.</p>`;
-            actionDock.classList.remove('hidden');
-        } else {
-            banner.className = 'verdict-card safe';
-            banner.innerHTML = `<h4>No supported vulnerabilities detected</h4><p>Estimate: ${score}/100. This checks supported patterns only and does not guarantee the code is secure.</p>`;
-            actionDock.classList.add('hidden');
-        }
+        banner.replaceChildren();
+        const verdict = document.createElement('h4');
+        verdict.textContent = detected.length
+            ? estimate.risk_level
+            : 'No issues identified in this review';
+        const summary = document.createElement('p');
+        summary.textContent = detected.length
+            ? `${detected.length} agent/scanner finding(s). Gemini score: ${score}/100; verify each finding independently.`
+            : `Gemini score: ${score}/100. This result is not proof that the code is secure.`;
+        banner.className = `verdict-card ${detected.length ? 'vuln' : 'safe'}`;
+        banner.append(verdict, summary);
 
-        // Probability Stacks
+        actionDock.classList.add('hidden');
+
         const probList = $('prob-list');
-        probList.innerHTML = '';
-        preds.sort((a,b) => b.probability - a.probability).forEach(p => {
-            const isDanger = p.class !== 'non-vulnerable' && p.detected;
-            const item = document.createElement('div');
-            item.className = `prob-item ${isDanger ? 'danger' : ''}`;
-            item.innerHTML = `
-                <div class="prob-header">
-                    <span class="prob-name">${p.class}</span>
-                    <span class="prob-pct">${(p.probability*100).toFixed(1)}%</span>
-                </div>
-                <div class="p-bar"><div class="p-fill" style="width: ${p.probability*100}%"></div></div>
-            `;
+        probList.replaceChildren();
+        if (preds.length === 0) {
+            const empty = document.createElement('p');
+            empty.textContent = 'No findings were returned by the agent or supported Clang checks.';
+            probList.appendChild(empty);
+        }
+        preds.forEach(finding => {
+            const item = document.createElement('article');
+            item.className = `prob-item ${finding.detected ? 'danger' : ''}`;
+            const header = document.createElement('div');
+            header.className = 'prob-header';
+            const name = document.createElement('span');
+            name.className = 'prob-name';
+            name.textContent = `${finding.class}: ${finding.title}`;
+            const severity = document.createElement('span');
+            severity.className = 'prob-pct';
+            severity.textContent = finding.severity || finding.source || '';
+            header.append(name, severity);
+            item.appendChild(header);
+            if (finding.line) {
+                const line = document.createElement('p');
+                line.textContent = `Line ${finding.line}`;
+                item.appendChild(line);
+            }
+            if (finding.evidence) {
+                const evidence = document.createElement('p');
+                evidence.textContent = finding.evidence;
+                item.appendChild(evidence);
+            }
             probList.appendChild(item);
         });
 
-        // Code Highlight
-        if (window.highlightVulnerability && detected.length > 0) {
-            codeRender.innerHTML = `<code>${window.highlightVulnerability(code, detected[0].function)}</code>`;
-            setEditorMode('view');
-        } else {
-            codeRender.innerHTML = `<code>${escapeHtml(code)}</code>`;
-            setEditorMode('view');
-        }
+        codeRender.innerHTML = `<code>${escapeHtml(code)}</code>`;
+        setEditorMode('view');
     }
 
     function renderLlmReview(review) {
@@ -353,8 +446,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const heading = document.createElement('h4');
         heading.textContent = review.available
-            ? `Optional LLM review: ${review.risk_level} (${review.security_score}/100)`
-            : 'Optional LLM review unavailable';
+            ? `Gemini agent review: ${review.risk_level} (${review.security_score}/100)`
+            : 'Gemini agent review unavailable';
         panel.appendChild(heading);
 
         const summary = document.createElement('p');
@@ -441,6 +534,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     body: JSON.stringify({ code: currentCode, language: codeLanguage.value, mode: 'source' })
                 });
                 data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || `Repair proposal failed (${response.status}).`);
+                }
             }
 
             if (data.success && data.healed) {
@@ -448,15 +544,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 healHeader.textContent = data.message;
                 diffBefore.textContent = currentCode;
                 diffAfter.textContent = data.healed_code;
-                
-                if (confirm("Heal complete. Apply patched code to editor?")) {
-                    codeInput.value = data.healed_code;
-                    updateLineNumbers();
-                    setEditorMode('edit');
-                    scheduleLiveCheck();
-                }
+                pendingRepair = data.healed_code;
+                repairValidationStatus.textContent = data.compiler_validation && data.compiler_validation.valid
+                    ? 'Clang compilation passed. Review the diff before applying; this does not prove the repair is secure.'
+                    : 'Demo repair preview only: compiler validation was not run. Review carefully before applying.';
+                repairReviewActions.classList.remove('hidden');
+            } else if (data.success) {
+                $('heal-results').classList.remove('hidden');
+                healHeader.textContent = data.message || 'No repair proposal was produced.';
+                diffBefore.textContent = currentCode;
+                diffAfter.textContent = '';
+                discardRepairProposal();
             }
-        } catch (e) { console.error(e); }
+        } catch (e) {
+            $('heal-results').classList.remove('hidden');
+            healHeader.textContent = `Repair proposal unavailable: ${e.message}`;
+            diffBefore.textContent = currentCode;
+            diffAfter.textContent = '';
+            discardRepairProposal();
+        }
     });
 
     // ═══ PIPELINE ═══

@@ -52,7 +52,7 @@ def run_gnn_redetection(
     Returns:
         dict with 'success', 'predictions', 'detected_cwes'
     """
-    from ir_parser import parse_ll_file
+    from ir_parser import filter_functions_to_source, parse_ll_file
     from pyg_dataset import build_function_graph, NUM_CLASSES, instruction_features
     from torch_geometric.data import Batch
     import numpy as np
@@ -66,7 +66,7 @@ def run_gnn_redetection(
 
     try:
         # Parse the patched IR
-        ir_data = parse_ll_file(tmp_path)
+        ir_data = filter_functions_to_source(parse_ll_file(tmp_path))
 
         if not ir_data or not ir_data.get("functions"):
             return {
@@ -103,8 +103,13 @@ def run_gnn_redetection(
                     all_probs.append(probs)
 
             except Exception as e:
-                logger.warning("Failed to process function %s: %s", func.get("name", "?"), e)
-                continue
+                logger.exception(
+                    "Failed to validate repaired IR function %s.",
+                    func.get("name", "?"),
+                )
+                raise RuntimeError(
+                    f"Failed to validate repaired IR function {func.get('name', '?')}."
+                ) from e
 
         if not all_probs:
             return {

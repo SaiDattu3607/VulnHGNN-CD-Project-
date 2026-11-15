@@ -20,6 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ir_parser   import parse_ll_file, filter_functions_to_source
 from pyg_model   import build_pyg_model
 from pyg_dataset import build_function_graph, NUM_CLASSES
+
+logger = logging.getLogger("predict")
 # --- Constants ---
 CLASS_NAMES = ["non-vulnerable", "CWE-476", "CWE-191", "CWE-190", "CWE-369"]
 
@@ -124,6 +126,42 @@ def compile_to_ll(source_path: Path, support_dir: str) -> str:
         )
 
     return ll_path
+
+
+def validate_ir_with_clang(ir_content: str) -> dict:
+    """Validate patched LLVM IR by asking Clang to compile it to an object."""
+    ir_path = None
+    object_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".ll", delete=False, mode="w", encoding="utf-8"
+        ) as ir_file:
+            ir_file.write(ir_content)
+            ir_path = ir_file.name
+        with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as object_file:
+            object_path = object_file.name
+
+        try:
+            result = subprocess.run(
+                ["clang", "-x", "ir", "-c", ir_path, "-o", object_path],
+                capture_output=True,
+                text=True,
+                timeout=COMPILATION_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError(
+                f"LLVM IR validation timed out after {COMPILATION_TIMEOUT_SECONDS} seconds."
+            ) from error
+
+        return {
+            "valid": result.returncode == 0,
+            "diagnostics": result.stderr[:1200],
+        }
+    finally:
+        if ir_path and os.path.exists(ir_path):
+            os.unlink(ir_path)
+        if object_path and os.path.exists(object_path):
+            os.unlink(object_path)
 
 
 def find_division_by_zero_warnings(
@@ -472,11 +510,11 @@ def run_model_per_function(ir_data: dict, model, device, threshold: float) -> di
         import numpy as np
         dummy_label = np.zeros(NUM_CLASSES, dtype=np.float32)
 
-        try:
-            graph = build_function_graph(func, dummy_label)
-            if graph is None or graph.num_nodes == 0:
-                continue
+        graph = build_function_graph(func, dummy_label)
+        if graph is None or graph.num_nodes == 0:
+            continue
 
+        try:
             graph = graph.to(device)
             batch = Batch.from_data_list([graph])
 
@@ -484,29 +522,34 @@ def run_model_per_function(ir_data: dict, model, device, threshold: float) -> di
             with torch.no_grad():
                 logits = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
                 probs  = torch.sigmoid(logits).squeeze(0).cpu().tolist()
-                
-                # Pure GNN Inference (Raw Probs)
-                all_probs.append({
-                    "probs": probs,
-                    "function": func.get("name")
-                })
 
-        except Exception:
-            continue
+            all_probs.append({
+                "probs": probs,
+                "function": func.get("name")
+            })
+        except Exception as error:
+            logger.exception(
+                "Inference failed for source function %s.",
+                func.get("name", "<unknown>"),
+            )
+            raise RuntimeError(
+                f"Inference failed for source function {func.get('name', '<unknown>')}."
+            ) from error
 
     if not all_probs:
-        # fallback — return zeros
-        probs_final = [0.0] * NUM_CLASSES
-        best_funcs = [""] * NUM_CLASSES
-    else:
-        # Aggregate max probabilities across all functions for file-level verdict
-        probs_final = [0.0] * NUM_CLASSES
-        best_funcs = [""] * NUM_CLASSES
-        for entry in all_probs:
-            for i in range(NUM_CLASSES):
-                if entry["probs"][i] > probs_final[i]:
-                    probs_final[i] = entry["probs"][i]
-                    best_funcs[i] = entry["function"]
+        raise RuntimeError(
+            "No analyzable functions from the submitted source were found; "
+            "refusing to report a clean result."
+        )
+
+    # Aggregate max probabilities across all functions per class.
+    probs_final = [0.0] * NUM_CLASSES
+    best_funcs = [""] * NUM_CLASSES
+    for entry in all_probs:
+        for i in range(NUM_CLASSES):
+            if entry["probs"][i] > probs_final[i]:
+                probs_final[i] = entry["probs"][i]
+                best_funcs[i] = entry["function"]
     
     predictions = []
     for i, (name, prob) in enumerate(zip(CLASS_NAMES, probs_final)):

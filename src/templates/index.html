@@ -63,7 +63,7 @@
                         <i data-feather="cloud"></i> <span id="stat-co2">0.000</span> <small>kg CO₂</small>
                     </div>
                 </div>
-                <div class="engine-ver">Engine v9.2.0-GAT</div>
+                <div class="engine-ver">Web detection: Gemini + Clang</div>
             </div>
         </aside>
 
@@ -106,10 +106,7 @@
 
                 <footer class="pane-footer">
                     <div class="footer-hint">Ctrl + Enter to analyze</div>
-                    <label class="llm-consent" for="llm-review-consent">
-                        <input id="llm-review-consent" type="checkbox">
-                        <span>Optional LLM review. If enabled, send code up to 64 KB to the configured provider.</span>
-                    </label>
+                    <p class="llm-consent">Full analysis sends code (up to 64 KB) to the configured Gemini provider. Live Clang checks stay local.</p>
                     <button id="analyze-btn" class="btn-primary">
                         <i data-feather="play"></i> Analyze
                     </button>
@@ -137,14 +134,17 @@
 
                         <div id="state-loading" class="loading-view hidden">
                             <div class="loader"></div>
-                            <span>Running GNN Inference...</span>
+                            <span>Running agent and security checks...</span>
                         </div>
 
                         <div id="state-success" class="success-view hidden">
                             <div id="verdict-banner" class="verdict-card"></div>
                             <section id="llm-review-result" class="llm-review-card hidden" aria-live="polite"></section>
-                            <div class="section-label">Confidence Distribution</div>
+                            <div class="section-label">Agent and security-check findings</div>
                             <div id="prob-list" class="prob-stack"></div>
+                            <button id="btn-export-report" class="btn-sec report-export hidden" type="button">
+                                <i data-feather="download"></i> Export security report (JSON)
+                            </button>
                             
                             <div id="action-center" class="action-dock hidden">
                                 <button id="btn-localize" class="btn-sec"><i data-feather="map-pin"></i> Localize</button>
@@ -183,6 +183,11 @@
                                     <div class="diff-tag healed">Healed</div>
                                     <pre id="diff-after"></pre>
                                 </div>
+                            </div>
+                            <div id="repair-review-actions" class="repair-review-actions hidden">
+                                <p id="repair-validation-status"></p>
+                                <button id="btn-apply-repair" class="btn-primary" type="button">Apply reviewed repair</button>
+                                <button id="btn-discard-repair" class="btn-sec" type="button">Discard proposal</button>
                             </div>
                         </div>
                     </div>

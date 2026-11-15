@@ -1,14 +1,15 @@
 # VulnHGNN
 
-VulnHGNN is a tool built to help detect, localize, and fix software vulnerabilities using Graph Neural Networks (GNNs). It comes with a web UI for when you want an interactive visual experience, as well as a command-line interface (CLI) for running automated pipelines. As a bonus, it also tracks the carbon emissions from running the models.
+VulnHGNN uses a Gemini security-review agent and local Clang checks for full web analyses. The existing GNN-based analysis, localization, and repair pipeline remains available through legacy workflows and the CLI.
 
 ## What it does
-- Detects vulnerabilities automatically using PyTorch Geometric and GNNs.
-- Supports multi-label classification, meaning it can detect multiple types of vulnerabilities at once.
-- Localizes exactly where the vulnerability is in your code.
-- Features self-healing capabilities to automatically suggest and apply fixes.
-- Checks C syntax and supported vulnerability patterns while you type in the web editor, with secure-coding guidance for detected issues.
-- Provides an interactive web UI built with Flask to easily visualize and fix issues.
+- Reviews full web analyses with the configured Gemini model and combines its findings with local Clang checks.
+- Keeps the legacy PyTorch Geometric/GNN CLI and pipeline available for model-based detection and localization.
+- Keeps legacy self-healing workflows and compiler-checked, user-reviewed source repair proposals.
+- Exports the latest web analysis as a downloadable JSON security report.
+- Checks C syntax and constant division-by-zero warnings while you type in the web editor.
+- Runs debounced, local-only editor checks: Clang validates syntax and confirms constant division-by-zero warnings. Live checks do not call Gemini.
+- Provides an interactive Flask web UI to review agent and Clang findings.
 - Includes a full CLI pipeline to process source files and generate reports from your terminal.
 - Tracks carbon emissions using CodeCarbon to measure the environmental impact of your ML workloads.
 
@@ -29,24 +30,22 @@ The easiest way to use VulnHGNN is through the web app. Just double-click the `r
 
 If you prefer doing it manually, you can activate your environment, navigate to the `src` folder, and run `python app.py`.
 
-### Optional LLM Security Review
-The local GNN analysis works without an LLM. To enable the optional review, configure an OpenAI-compatible chat-completions provider on the server before starting Flask:
+### Gemini agent review for web analysis
+Every full web analysis sends source code (up to 64 KB) to the configured provider and requires a successful Gemini response. Live checks while typing remain local. To use a Gemini API key from Google AI Studio, configure the OpenAI-compatible endpoint before starting Flask:
 
 ```powershell
-$env:VULNHGNN_LLM_API_KEY = "<provider API key>"
-$env:VULNHGNN_LLM_MODEL = "<provider model name>"
-# Optional; defaults to the OpenAI chat-completions endpoint.
-$env:VULNHGNN_LLM_API_URL = "https://api.openai.com/v1/chat/completions"
+Copy-Item .env.example .env
+# Open .env and paste your Google AI Studio key into VULNHGNN_LLM_API_KEY.
 python src/app.py
 ```
 
-In the UI, check **Optional LLM review** to consent to sending the source to that provider. It is unchecked by default, and source over 64 KB is not sent. The provider returns a separate advisory score and findings; it does not control or apply repairs. Review the provider's data-handling policy before sending code.
+The example selects `gemini-3.1-flash-lite` and Google's OpenAI-compatible endpoint. The app loads `.env` from the repository root. Keep that file private; `.env` is ignored by Git. Never paste the key into source code, commit it, or send it in chat. Pressing **Analyze** sends source to the configured provider; source over 64 KB is not sent. If the provider is unconfigured or unavailable, the full analysis returns an explicit error rather than falling back to GNN predictions. Gemini findings are advisory and do not execute code or apply repairs. Free-tier eligibility and request limits depend on Google's current model and account quotas. Review Google's data-handling terms before sending proprietary code.
 
 ### Live editor checks
-After a short pause in typing, the web editor compiles the selected C or C++ source with Clang. To avoid false alarms, live security findings are shown only for constant division-by-zero cases Clang can directly confirm; GNN predictions are not shown in the live panel. Other vulnerability types are not confirmed by this live check. Live checks do not send code to an LLM provider and do not modify the source. A clean live check does not prove that code is secure. The separate Analyze action still uses the GNN to estimate supported patterns. Install Clang to use live syntax validation and constant division-by-zero checks.
+After a short pause in typing, the web editor compiles the selected C or C++ source with Clang and reports syntax errors and any constant division-by-zero warnings Clang confirms. These live checks do not send code to Gemini or modify source, and they do not detect all vulnerability types. Press **Analyze** for a full Gemini-assisted review combined with Clang checks. A clean result does not prove that code is secure. Install Clang for syntax and local security checks.
 
 ### Running the CLI
-If you want to process files directly from the command line, you can use the `run_pipeline.bat` script. By default, it runs a test file against our pre-trained model. 
+If you want to process files directly from the command line, you can use the `run_pipeline.bat` script. The CLI and self-healing pipeline continue to use the existing GNN model. By default, the launcher runs a test file against the pre-trained model.
 
 To run it on your own files, you can manually run the pipeline like this:
 1. Activate your virtual environment.
@@ -56,5 +55,14 @@ To run it on your own files, you can manually run the pipeline like this:
 ## Folder structure
 
 ## Architecture
-See [docs/architecture.md](docs/architecture.md) for the end-to-end architecture, runtime flow, security controls, and bounded self-healing agent cycle.
-Open the [updated architecture diagram PNG](docs/vulnhgnn_full_architecture_with_llm_review.png) directly for presentations.
+See [docs/architecture.md](docs/architecture.md) for a plain-language comparison of what changed, why it helps, the runtime flow, and the bounded repair loop.
+Open the [updated architecture diagram PNG](docs/vulnhgnn_updated_architecture.png) for presentations. It keeps the original phase-based, pastel-box style and adds real-time editor checks and compiler-checked, user-reviewed repair proposals.
+
+### Diagnostic fixture evaluation
+Run the local model over the repository's ten labeled C fixtures and save a reproducible diagnostic report:
+
+```powershell
+python src/evaluate_fixtures.py --model results/pyg_gnn_v9/best_pyg_model.pt --output results/fixture_diagnostic.json
+```
+
+These fixtures may overlap training or tuning data, so this report is **not** an independent held-out benchmark. Model training now splits graphs by source file to prevent functions from the same file appearing in multiple splits; retrain with a complete labeled corpus before using its metrics as generalization evidence.

@@ -12,13 +12,18 @@ Endpoints:
 
 import os
 import sys
-import json
 import logging
 import tempfile
+import threading
+import time
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template
 
 import torch
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from predict import (
@@ -28,13 +33,11 @@ from predict import (
     compile_to_ll,
     find_division_by_zero_warnings,
 )
-from pyg_dataset import NUM_CLASSES
 from security import (
-    calculate_security_estimate,
     validate_source_input,
 )
 from llm_security_review import review_code_security
-from ir_parser import filter_functions_to_source
+from ir_parser import filter_functions_to_source, parse_ll_file
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
@@ -42,7 +45,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
 # Global variables for model
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_PATH = str(PROJECT_ROOT / "results" / "pyg_gnn_v9" / "best_pyg_model.pt")
 SUPPORT_DIR = str(PROJECT_ROOT / "dataset" / "test_case_support")
 THRESHOLD = 0.5
@@ -50,6 +52,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MODEL = None
 CKPT = None
+MODEL_LOCK = threading.Lock()
 
 SECURE_CODING_GUIDANCE = {
     "CWE-190": "Check arithmetic bounds before addition or multiplication. Use checked arithmetic or a wider type, and validate input ranges.",
@@ -70,6 +73,15 @@ def init_model():
             logger.warning(f"Model path {MODEL_PATH} not found. Ensure the model has been trained.")
     except Exception as e:
         logger.error(f"Error loading model: {e}")
+
+
+def _ensure_model_loaded():
+    if MODEL is not None:
+        return True
+    with MODEL_LOCK:
+        if MODEL is None:
+            init_model()
+    return MODEL is not None
 
 
 def _validated_code_payload():
@@ -94,10 +106,6 @@ def _source_suffix(data):
     return ".cpp" if data.get("language", "c") == "cpp" else ".c"
 
 
-# Initialize model on startup
-init_model()
-
-
 # ════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ════════════════════════════════════════════════════════════════════════
@@ -109,7 +117,7 @@ def index():
 
 @app.route("/api/live-check", methods=["POST"])
 def live_check_code():
-    """Validate C syntax and run local supported-CWE checks for editor feedback."""
+    """Run local Clang syntax and constant division-by-zero checks while typing."""
     data, code, error = _validated_code_payload()
     if error:
         return jsonify({"success": False, "error": error[0]}), error[1]
@@ -152,18 +160,18 @@ def live_check_code():
             }), 503
 
         division_lines = find_division_by_zero_warnings(source_path, SUPPORT_DIR)
-        findings = [
-            {
+        findings_by_class = {}
+        for line in division_lines:
+            finding = findings_by_class.setdefault("CWE-369", {
                 "class": "CWE-369",
-                "name": "Divide by Zero",
-                "severity": "CONFIRMED",
-                "line": line,
-                "description": "Clang found a constant division by zero in the submitted source.",
+                "name": CWE_INFO["CWE-369"]["full_name"],
+                "severity": "CLANG CONFIRMED",
+                "description": "Constant division by zero reported by Clang.",
                 "recommendation": SECURE_CODING_GUIDANCE["CWE-369"],
-            }
-            for line in division_lines
-        ]
+            })
+            finding.setdefault("lines", []).append(line)
 
+        findings = list(findings_by_class.values())
         suggestions = [
             {
                 "title": f"{finding['class']}: {finding['name']}",
@@ -171,12 +179,6 @@ def live_check_code():
             }
             for finding in findings
         ]
-        security_predictions = [{
-            "class": finding["class"],
-            "detected": True,
-            "probability": 1.0,
-            "severity": finding["severity"],
-        } for finding in findings]
         return jsonify({
             "success": True,
             "validity": {
@@ -184,13 +186,15 @@ def live_check_code():
                 "message": "Clang compiled this source successfully.",
             },
             "security": {
-                "status": "limited",
+                "status": "available",
                 "verdict": "confirmed_issues" if findings else "no_confirmed_issues",
-                "estimate": calculate_security_estimate(security_predictions),
                 "findings": findings,
+                "predictions": [],
+                "checked_classes": ["CWE-369"],
                 "scope": (
-                    "Live findings only include Clang-confirmed constant division by zero. "
-                    "Other vulnerability types are not confirmed by this live check."
+                    "Live checks use Clang locally and do not call Gemini. "
+                    "Clang validates syntax and directly confirms only constant "
+                    "division-by-zero warnings; other vulnerabilities may be missed."
                 ),
             },
             "suggestions": suggestions,
@@ -207,85 +211,115 @@ def live_check_code():
 
 @app.route("/api/analyze", methods=["POST"])
 def analyze_code():
-    """Detect vulnerabilities in submitted C/C++ code."""
+    """Run the Gemini security review and local Clang checks on submitted code."""
     data, code, error = _validated_code_payload()
     if error:
         return jsonify({"success": False, "error": error[0]}), error[1]
-    request_llm_review = data.get("llm_review", False)
-    if not isinstance(request_llm_review, bool):
-        return jsonify({"success": False, "error": "llm_review must be a boolean."}), 400
 
-    if MODEL is None:
-        return jsonify({"success": False, "error": f"Model not loaded. Ensure {MODEL_PATH} exists."}), 500
-
-    # Write code to a temporary file
-    with tempfile.NamedTemporaryFile(suffix=_source_suffix(data), delete=False, mode="w") as tmp:
+    started_at = time.perf_counter()
+    with tempfile.NamedTemporaryFile(
+        suffix=_source_suffix(data), delete=False, mode="w", encoding="utf-8"
+    ) as tmp:
         tmp.write(code)
-        tmp_path = tmp.name
-
+        source_path = Path(tmp.name)
+    ll_path = None
     try:
-        source_path = Path(tmp_path)
-        # On Windows, we must ensure the file is closed or shared properly.
-        # tempfile.NamedTemporaryFile with delete=False is fine, but it might still be open in the context manager.
-    finally:
-        pass # The 'with' block above already closed the file if it finished.
-
-    try:
-        source_path = Path(tmp_path)
-        result = predict_file(
-            source_path=source_path,
-            model=MODEL,
-            device=DEVICE,
-            support_dir=SUPPORT_DIR,
-            threshold=THRESHOLD,
-            keep_ll=False,
-            verbose=False,
-        )
-
-        if not result["success"]:
+        ll_path = compile_to_ll(source_path, SUPPORT_DIR)
+        division_lines = find_division_by_zero_warnings(source_path, SUPPORT_DIR)
+        agent_review = review_code_security(code)
+        if not agent_review.get("available"):
             return jsonify({
                 "success": False,
-                "error": result.get("error", "Unknown validation error")
-            }), 400
+                "error": (
+                    "Gemini security review did not complete; no agent-based "
+                    "analysis result is available. " + agent_review.get(
+                        "message", "Check the configured provider and try again."
+                    )
+                ),
+                "agent_review": agent_review,
+                "security_checks": {
+                    "clang_compilation": "passed",
+                    "division_by_zero_lines": division_lines,
+                },
+            }), 503
 
-        # Enhance results with CWE info
-        enhanced_probabilities = []
-        for p in result["probabilities"]:
-            cwe = p["class"]
-            info = CWE_INFO.get(cwe, {})
-            enhanced_probabilities.append({
-                "class": cwe,
-                "probability": p["probability"],
-                "detected": p["detected"],
-                "function": p.get("function", ""),
-                "full_name": info.get("full_name", ""),
-                "description": info.get("description", ""),
-                "severity": info.get("severity", ""),
+        findings = []
+        for finding in agent_review["findings"]:
+            cwe = finding.get("cwe")
+            info = CWE_INFO.get(cwe, {}) if cwe else {}
+            findings.append({
+                "class": cwe or "Security finding",
+                "title": finding["title"] or "Potential security issue",
+                "full_name": info.get("full_name", finding["title"]),
+                "probability": None,
+                "detected": True,
+                "severity": finding["severity"].upper(),
+                "line": finding["line"],
+                "evidence": finding["evidence"],
+                "description": finding["reason"],
+                "recommendation": finding["recommendation"],
+                "source": "Gemini agent",
+            })
+        for line in division_lines:
+            findings.append({
+                "class": "CWE-369",
+                "title": "Constant division by zero",
+                "full_name": CWE_INFO["CWE-369"]["full_name"],
+                "probability": None,
+                "detected": True,
+                "severity": "HIGH",
+                "line": line,
+                "evidence": f"Clang reported constant division by zero on line {line}.",
+                "description": "Clang compiler diagnostic.",
+                "recommendation": SECURE_CODING_GUIDANCE["CWE-369"],
+                "source": "Clang",
             })
 
-        security_estimate = calculate_security_estimate(enhanced_probabilities)
-        llm_review = (
-            review_code_security(code)
-            if request_llm_review
-            else {"requested": False, "available": False, "status": "not_requested"}
-        )
+        supported_cwes = {"CWE-190", "CWE-191", "CWE-369", "CWE-476"}
+        detected_cwes = {
+            finding["class"] for finding in findings
+            if finding["class"] in supported_cwes
+        }
+        security_estimate = {
+            "score": agent_review["security_score"],
+            "risk_level": agent_review["risk_level"],
+        }
 
         return jsonify({
             "success": True,
-            "elapsed": result["elapsed"],
-            "thresholds": result["thresholds"],
-            "predictions": enhanced_probabilities,
+            "elapsed": time.perf_counter() - started_at,
+            "predictions": findings,
+            "detected_cwes": sorted(detected_cwes),
             "security_estimate": security_estimate,
-            "llm_review": llm_review,
+            "agent_review": agent_review,
+            "security_checks": {
+                "clang_compilation": "passed",
+                "division_by_zero_lines": division_lines,
+            },
         })
-
-    except Exception as e:
-        logger.error(f"Prediction pipeline error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+    except TimeoutError as e:
+        logger.warning("Clang analysis timed out: %s", e)
+        return jsonify({"success": False, "error": "Clang analysis timed out."}), 503
+    except RuntimeError as e:
+        return jsonify({"success": False, "error": str(e)[:1200]}), 400
+    except OSError:
+        logger.exception("Could not start Clang for full analysis.")
+        return jsonify({
+            "success": False,
+            "error": "Clang is unavailable. Install Clang to run security checks.",
+        }), 503
+    except Exception:
+        logger.exception("Agent security analysis failed.")
+        return jsonify({
+            "success": False,
+            "error": "Agent security analysis failed. See the server log for details.",
+        }), 500
 
     finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if ll_path and os.path.exists(ll_path):
+            os.unlink(ll_path)
+        if os.path.exists(source_path):
+            os.unlink(source_path)
 
 
 @app.route("/api/localize", methods=["POST"])
@@ -313,7 +347,7 @@ def localize_code():
     if not cwes:
         return jsonify({"success": False, "error": "No CWEs specified for localization"}), 400
 
-    if MODEL is None:
+    if not _ensure_model_loaded():
         return jsonify({"success": False, "error": "Model not loaded"}), 500
 
     # Write code to temp file
@@ -389,7 +423,7 @@ def heal_code_endpoint():
     """
     from healer import heal_code as source_heal
     from ir_healer import repair_ir
-    from predict import compile_to_ll
+    from predict import compile_to_ll, validate_ir_with_clang
     from ir_parser import parse_ll_file
 
     data, code, error = _validated_code_payload()
@@ -397,7 +431,7 @@ def heal_code_endpoint():
         return jsonify({"success": False, "error": error[0]}), error[1]
     mode = data.get("mode", "source")
 
-    if MODEL is None:
+    if not _ensure_model_loaded():
         return jsonify({"success": False, "error": "Model not loaded"}), 500
 
     # First detect vulnerabilities
@@ -442,13 +476,22 @@ def heal_code_endpoint():
                     ir_content = f.read()
                 repair_result = repair_ir(ir_content, detected)
                 logger.info(f"IR repair result: {repair_result.get('total_patches')} patches applied.")
+                patched_ir = repair_result.get("patched_ir", ir_content)
+                compiler_validation = validate_ir_with_clang(patched_ir)
+                if not compiler_validation["valid"]:
+                    return jsonify({
+                        "success": False,
+                        "error": "The proposed IR repair failed Clang validation and was withheld.",
+                        "compiler_validation": compiler_validation,
+                    }), 422
                 return jsonify({
                     "success": True,
                     "healed": repair_result.get("total_patches", 0) > 0,
                     "mode": "ir",
                     "detected_cwes": detected,
                     "patches": repair_result.get("patches", []),
-                    "patched_ir": repair_result.get("patched_ir", ir_content),
+                    "patched_ir": patched_ir,
+                    "compiler_validation": compiler_validation,
                     "message": repair_result.get("message", "IR healing attempted."),
                 })
             finally:
@@ -458,13 +501,51 @@ def heal_code_endpoint():
             # Source-level healing
             heal_result = source_heal(code, detected)
             logger.info(f"Source repair result: {len(heal_result.get('patches', []))} patches attempted.")
+            healed_code = heal_result.get("healed_code", code)
+            applied_patches = any(patch["applied"] for patch in heal_result.get("patches", []))
+            compiler_validation = None
+            if applied_patches:
+                validation_path = None
+                validation_ir_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        suffix=_source_suffix(data),
+                        delete=False,
+                        mode="w",
+                        encoding="utf-8",
+                    ) as validation_file:
+                        validation_file.write(healed_code)
+                        validation_path = Path(validation_file.name)
+                    validation_ir_path = compile_to_ll(validation_path, SUPPORT_DIR)
+                    compiler_validation = {
+                        "valid": True,
+                        "message": "Clang compilation passed; review the proposed diff before applying it.",
+                    }
+                except (RuntimeError, TimeoutError) as validation_error:
+                    logger.warning("Withholding source repair that failed Clang validation.")
+                    return jsonify({
+                        "success": False,
+                        "error": "The proposed source repair failed Clang validation and was withheld.",
+                        "compiler_validation": {
+                            "valid": False,
+                            "diagnostics": str(validation_error)[:1200],
+                        },
+                    }), 422
+                finally:
+                    if validation_path and validation_path.exists():
+                        validation_path.unlink()
+                    if validation_ir_path and os.path.exists(validation_ir_path):
+                        os.unlink(validation_ir_path)
+
             return jsonify({
                 "success": True,
-                "healed": any(p["applied"] for p in heal_result.get("patches", [])),
+                "healed": applied_patches,
                 "mode": "source",
                 "detected_cwes": detected,
                 "patches": heal_result.get("patches", []),
-                "healed_code": heal_result.get("healed_code", code),
+                "healed_code": healed_code,
+                "compiler_validation": compiler_validation,
+                "requires_user_approval": True,
                 "message": heal_result.get("message", "Source healing attempted."),
             })
 
@@ -500,7 +581,7 @@ def full_pipeline():
         return jsonify({"success": False, "error": "max_iterations must be an integer from 1 to 5."}), 400
     carbon_tracking = data.get("carbon_tracking", True)
 
-    if MODEL is None:
+    if not _ensure_model_loaded():
         return jsonify({"success": False, "error": "Model not loaded"}), 500
 
     # Initialize carbon tracker if requested
